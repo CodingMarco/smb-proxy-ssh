@@ -2,40 +2,44 @@ import subprocess
 import os
 import yaml
 import random
-import string
+import time
 
 def generate_random_port():
     return random.randint(49152, 65535)  # Port range for dynamic/private ports
 
-def open_ssh_tunnel(hostname, username, password, remote_port):
+def open_ssh_tunnel(hostname, ssh_user, ssh_password, ssh_private_key_path, remote_port):
     local_port = generate_random_port()
-    subprocess.call(['ssh', '-L', f'{local_port}:localhost:{remote_port}', f'{username}@{hostname}'],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return local_port
+    ssh_command = ['ssh', '-nNT', '-L', f'{local_port}:localhost:{remote_port}', f'{ssh_user}@{hostname}']
 
-def mount_share(hostname, ssh_user, ssh_password, ssh_private_key_name, smbcredentials_file_path, share, mount_path):
-    mount_dir = os.path.join(mount_path, hostname.replace(".", "_"), share.replace("/", "_"))
-    os.makedirs(mount_dir, exist_ok=True)
+    if ssh_private_key_path:
+        ssh_command += ['-i', ssh_private_key_path]
+    else:
+        ssh_command = ['sshpass', '-p', ssh_password] + ssh_command
 
-    subprocess.call(['sshpass', '-p', ssh_password, 'ssh', '-o', 'StrictHostKeyChecking=no',
-                     '-i', ssh_private_key_name, f'{ssh_user}@{hostname}', 'mkdir', '-p', smbcredentials_file_path])
-    subprocess.call(['sshpass', '-p', ssh_password, 'scp', '-o', 'StrictHostKeyChecking=no',
-                     '-i', ssh_private_key_name, smbcredentials_file_path,
-                     f'{ssh_user}@{hostname}:{smbcredentials_file_path}'])
+    process = subprocess.Popen(ssh_command, start_new_session=True)
+    # Wait until the tunnel is open
+    while True:
+        try:
+            subprocess.check_output(['nc', '-z', 'localhost', str(local_port)])
+            break
+        except subprocess.CalledProcessError:
+            time.sleep(0.05)
 
-    subprocess.call(['sudo', 'mount', '-t', 'cifs', '-o', f'credentials={smbcredentials_file_path}',
+    return local_port, process
+
+def mount_share(smbcredentials_file_path, share, port, mount_dir):
+    subprocess.call(['mount', '-t', 'cifs', '-o', f'credentials={smbcredentials_file_path},port={port}',
                      f'//localhost/{share}', mount_dir])
 
     return mount_dir
 
-def generate_smb_share_config(targets):
-    config = "[global]\nworkgroup = WORKGROUP\n\n"
-    for pc_name, pc_data in targets.items():
-        for share_path in pc_data['shares']:
-            share_name = f"{pc_name}_{share_path.replace('/', '_')}"
-            config += f"[{share_name}]\n"
-            config += f"path = {os.path.join('/mnt/shareproxy', pc_name.replace('.', '_'), share_path.replace('/', '_'))}\n"
-            config += "read only = no\n\n"
+def get_single_share_config(share_name, share_path):
+    config =  f"[{share_name}]\n"
+    config += f"    path = {share_path}\n"
+    config +=  "    read only = no\n"
+    config +=  "    inherit permissions = yes\n"
+    config +=  "\n"
+
     return config
 
 def setup_smb_proxy(config_path):
@@ -46,33 +50,60 @@ def setup_smb_proxy(config_path):
     proxy_password = config['proxy']['password']
     targets = config['targets']
 
-    smbcredentials_file_path = os.path.join('/etc/samba/smbcredentials', ''.join(random.choices(string.ascii_letters + string.digits, k=8)))
-    os.makedirs(os.path.dirname(smbcredentials_file_path), exist_ok=True)
+    smb_config =  "[global]\n"
+    smb_config += "    server role = standalone server\n\n"
+    ssh_processes = []
+    mount_paths = []
+    for target_name, target_config in targets.items():
+        hostname = target_config['hostname']
+        ssh_user = target_config['ssh_user']
+        ssh_password = target_config.get('ssh_password')
+        ssh_private_key_path = target_config.get('ssh_private_key_path')
+        smbcredentials_file_path = os.path.join(os.getcwd(), target_config['smbcredentials_file_path'])
+        shares = target_config['shares']
 
-    subprocess.call(['sudo', 'mkdir', '-p', '/mnt/shareproxy'])
+        local_port, process = open_ssh_tunnel(hostname, ssh_user, ssh_password, ssh_private_key_path, 445)
+        if process.poll() is not None:
+            raise Exception(f"Failed to open SSH tunnel to {hostname}")
 
-    smb_conf_path = '/etc/samba/smb.conf'
-    smb_share_config = generate_smb_share_config(targets)
-    with open(smb_conf_path, 'w') as file:
-        file.write(smb_share_config)
-
-    subprocess.call(['sudo', 'service', 'smbd', 'restart'])
-
-    for pc_name, pc_data in targets.items():
-        hostname = pc_data['hostname']
-        ssh_user = pc_data['ssh_user']
-        ssh_password = pc_data['ssh_password']
-        ssh_private_key_name = pc_data['ssh_private_key_name']
-        shares = pc_data['shares']
-
-        local_port = open_ssh_tunnel(hostname, proxy_username, proxy_password, 445)
+        ssh_processes.append(process)
 
         for share in shares:
-            mount_path = '/mnt/shareproxy'
-            mount_share(hostname, ssh_user, ssh_password, ssh_private_key_name,
-                        smbcredentials_file_path, share, mount_path)
+            share_path_as_name = share.strip('/').replace('/', '_')
+            share_name = f"{target_name}_{share_path_as_name}"
+            share_mount_path = os.path.join('/mnt/shareproxy', target_name, share_path_as_name)
+            os.makedirs(share_mount_path, exist_ok=True)
+            smb_config += get_single_share_config(share_name, share_mount_path)
+
+            mount_share(smbcredentials_file_path, share, local_port, share_mount_path)
+            print(f"Mounted {share} to {share_mount_path}")
+            mount_paths.append(share_mount_path)
+
+    smb_conf_path = 'smb.conf'
+    with open(smb_conf_path, 'w') as file:
+        file.write(smb_config)
 
     print("SMB-SSH-Proxy setup completed.")
+    return ssh_processes, mount_paths
 
-# Usage:
-setup_smb_proxy('config.yaml')
+
+def cleanup(ssh_processes, mount_paths):
+    for mount_path in mount_paths:
+        subprocess.call(['umount', mount_path])
+
+    for process in ssh_processes:
+        process.kill()
+
+    print("SMB-SSH-Proxy cleanup completed.")
+
+
+if __name__ == '__main__':
+    ssh_processes, mount_paths = setup_smb_proxy('test.yml')
+    try:
+        while True: time.sleep(1)
+    except KeyboardInterrupt:
+        print("Exiting on keyboard interrupt")
+    except Exception as e:
+        print(f"Exiting due to exception: {e}")
+    finally:
+        cleanup(ssh_processes, mount_paths)

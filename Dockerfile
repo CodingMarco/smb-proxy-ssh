@@ -1,4 +1,4 @@
-FROM python:3.9
+FROM python:3.10
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y sshpass cifs-utils
@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y sshpass cifs-utils
 WORKDIR /app
 
 # Copy the Python script and requirements file
-COPY requirements.txt smb_ssh_proxy.py /app/
+COPY requirements.txt main.py /app/
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 EXPOSE 445
 
 # Set the entrypoint
-ENTRYPOINT ["python", "smb_ssh_proxy.py"]
+ENTRYPOINT ["python", "main.py"]
 
 # Specify the volume mount points
 VOLUME ["/config", "/smbcredentials", "/ssh_private_keys"]

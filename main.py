@@ -9,10 +9,12 @@ def generate_random_port():
 
 def open_ssh_tunnel(hostname, ssh_user, ssh_password, ssh_private_key_path, remote_port):
     local_port = generate_random_port()
-    ssh_command = ['ssh', '-nNT', '-L', f'{local_port}:localhost:{remote_port}', f'{ssh_user}@{hostname}']
+    ssh_command = ['ssh', '-o', 'StrictHostKeyChecking=accept-new', '-nNT',
+                   '-L', f'{local_port}:localhost:{remote_port}', f'{ssh_user}@{hostname}']
 
     if ssh_private_key_path:
         ssh_command += ['-i', ssh_private_key_path]
+        subprocess.call(["ssh-keygen", "-R", hostname])
     else:
         ssh_command = ['sshpass', '-p', ssh_password] + ssh_command
 
@@ -32,7 +34,7 @@ def open_ssh_tunnel(hostname, ssh_user, ssh_password, ssh_private_key_path, remo
     return local_port, process
 
 def mount_share(smbcredentials_file_path, share, port, mount_dir):
-    subprocess.call(['mount', '-t', 'cifs', '-o', f'credentials={smbcredentials_file_path},port={port}',
+    subprocess.call(['mount', '-t', 'cifs', '-o', f'credentials={smbcredentials_file_path},port={port},file_mode=0777,dir_mode=0777',
                      f'//localhost/{share}', mount_dir])
 
     return mount_dir
@@ -48,7 +50,9 @@ def get_single_share_config(share_name, share_path):
 
 def setup_smb_proxy_credentials(username, password):
     subprocess.call(["useradd", username])
-    subprocess.call(["echo", "-ne", f"{password}\n{password}\n", "|", "smbpasswd", "-s", "-a", username])
+    p = subprocess.Popen(["smbpasswd", "-s", "-a", username], stdin=subprocess.PIPE)
+    p.communicate(input=f"{password}\n{password}\n".encode())
+    p.wait()
 
 def setup_smb_proxy(config_path):
     with open(config_path) as file:
@@ -91,8 +95,10 @@ def setup_smb_proxy(config_path):
     with open(smb_conf_path, 'w') as file:
         file.write(smb_config)
 
+    setup_smb_proxy_credentials(proxy_username, proxy_password)
+
     print("Starting SMB server")
-    smbd_process = subprocess.Popen(['smbd', '--foreground', '--log-stdout', '--configfile', smb_conf_path])
+    smbd_process = subprocess.Popen(['smbd', '--foreground', f'--configfile={smb_conf_path}'])
     print("SMB server started")
 
     print("SMB-SSH-Proxy setup completed.")
@@ -101,7 +107,7 @@ def setup_smb_proxy(config_path):
 
 def cleanup(ssh_processes, mount_paths, proxy_username, smbd_process):
     for mount_path in mount_paths:
-        subprocess.call(['umount', mount_path])
+        subprocess.call(['umount', mount_path, "-l"])
 
     for process in ssh_processes:
         process.terminate()
@@ -110,7 +116,7 @@ def cleanup(ssh_processes, mount_paths, proxy_username, smbd_process):
 
     # Remove smb user
     subprocess.call(["smbpasswd", "-x", proxy_username])
-    subprocess.call(["userdel", "-r", proxy_username])
+    subprocess.call(["userdel", proxy_username])
 
     print("SMB-SSH-Proxy cleanup completed.")
 

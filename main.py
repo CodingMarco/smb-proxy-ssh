@@ -16,14 +16,18 @@ def open_ssh_tunnel(hostname, ssh_user, ssh_password, ssh_private_key_path, remo
     else:
         ssh_command = ['sshpass', '-p', ssh_password] + ssh_command
 
+    # Use start_new_session=True so that keyboard interrupts are *NOT* propagated to the subprocess
+    # Since we need to unmount all shares before the SSH tunnels are terminated to avoid "target is busy" errors
     process = subprocess.Popen(ssh_command, start_new_session=True)
     # Wait until the tunnel is open
+    print(f"Waiting for SSH tunnel to {hostname} to open on port {local_port}")
     while True:
         try:
             subprocess.check_output(['nc', '-z', 'localhost', str(local_port)])
             break
         except subprocess.CalledProcessError:
             time.sleep(0.05)
+    print(f"SSH tunnel to {hostname} opened on port {local_port}")
 
     return local_port, process
 
@@ -41,6 +45,10 @@ def get_single_share_config(share_name, share_path):
     config +=  "\n"
 
     return config
+
+def setup_smb_proxy_credentials(username, password):
+    subprocess.call(["useradd", username])
+    subprocess.call(["echo", "-ne", f"{password}\n{password}\n", "|", "smbpasswd", "-s", "-a", username])
 
 def setup_smb_proxy(config_path):
     with open(config_path) as file:
@@ -83,22 +91,32 @@ def setup_smb_proxy(config_path):
     with open(smb_conf_path, 'w') as file:
         file.write(smb_config)
 
+    print("Starting SMB server")
+    smbd_process = subprocess.Popen(['smbd', '--foreground', '--log-stdout', '--configfile', smb_conf_path])
+    print("SMB server started")
+
     print("SMB-SSH-Proxy setup completed.")
-    return ssh_processes, mount_paths
+    return ssh_processes, mount_paths, proxy_username, smbd_process
 
 
-def cleanup(ssh_processes, mount_paths):
+def cleanup(ssh_processes, mount_paths, proxy_username, smbd_process):
     for mount_path in mount_paths:
         subprocess.call(['umount', mount_path])
 
     for process in ssh_processes:
-        process.kill()
+        process.terminate()
+
+    smbd_process.terminate()
+
+    # Remove smb user
+    subprocess.call(["smbpasswd", "-x", proxy_username])
+    subprocess.call(["userdel", "-r", proxy_username])
 
     print("SMB-SSH-Proxy cleanup completed.")
 
 
 if __name__ == '__main__':
-    ssh_processes, mount_paths = setup_smb_proxy('test.yml')
+    ssh_processes, mount_paths, proxy_username, smbd_process = setup_smb_proxy('test.yml')
     try:
         while True: time.sleep(1)
     except KeyboardInterrupt:
@@ -106,4 +124,4 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Exiting due to exception: {e}")
     finally:
-        cleanup(ssh_processes, mount_paths)
+        cleanup(ssh_processes, mount_paths, proxy_username, smbd_process)
